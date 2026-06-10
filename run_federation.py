@@ -39,7 +39,14 @@ from client import (
     train_local,
 )
 from model import LocalGenomeNet
-from strategy import _weighted_average
+from strategy import FedGenomeStrategy, _weighted_average
+
+try:
+    from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
+    from flwr.server.strategy import FedAvg
+    _FLWR_AVAILABLE = True
+except ImportError:
+    _FLWR_AVAILABLE = False
 
 DATA_DIR    = Path(__file__).parent / "data"
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -84,6 +91,44 @@ def run_centralized(site_data: Dict[str, List], epochs: int = 10) -> Dict:
         "equity_gap": round(float(np.std(aucs)), 4),
         "history":    [],
     }
+
+
+# ─── Aggregation helpers ───────────────────────────────────────────────────────
+
+class _FitResult:
+    """Minimal stand-in for Flower FitRes when running manual simulation."""
+
+    def __init__(self, parameters, num_examples: int, metrics: Dict) -> None:
+        self.parameters   = parameters
+        self.num_examples = num_examples
+        self.metrics      = metrics
+
+
+def _aggregate_round(
+    strategy:     str,
+    rnd:          int,
+    local_params: List,
+    weights_list: List[float],
+    site_records: Dict[str, List],
+    sites_order:  List[str],
+) -> List:
+    """Aggregate local models; uses FedGenomeStrategy.aggregate_fit() for fedgenome."""
+    if strategy == "fedgenome" and _FLWR_AVAILABLE:
+        results = []
+        for site, params, w in zip(sites_order, local_params, weights_list):
+            n = len(site_records[site])
+            results.append((
+                None,
+                _FitResult(
+                    parameters=ndarrays_to_parameters(params),
+                    num_examples=n,
+                    metrics={"precision": w},
+                ),
+            ))
+        strategy_obj = FedGenomeStrategy()
+        aggregated_params, _ = strategy_obj.aggregate_fit(rnd, results, [])
+        return parameters_to_ndarrays(aggregated_params)
+    return _weighted_average(local_params, weights_list)
 
 
 # ─── Federated simulation ────────────────────────────────────────────────────
@@ -137,7 +182,10 @@ def run_federated(
             else:
                 weights_list.append(float(len(records)))   # FedAvg / FedProx
 
-        aggregated = _weighted_average(local_params, weights_list)
+        sites_order = list(site_data.keys())
+        aggregated  = _aggregate_round(
+            strategy, rnd, local_params, weights_list, site_data, sites_order
+        )
         set_parameters(global_model, aggregated)
 
         mean_auc = float(np.mean(site_aucs))

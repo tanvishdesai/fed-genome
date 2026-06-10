@@ -2,57 +2,54 @@
 FedGenome Data Preparation
 ===========================
 Reads ClinVar variant_summary.txt, creates pathogenic/benign labels,
-synthesises ±20 bp genomic context sequences, and partitions into
-3 non-IID hospital sites using chromosome-band separation.
-
-Usage:
-  python scripts/download_data.py   # download ClinVar (one-time)
-  python prepare_data.py            # build site partitions
+extracts real ±20 bp genomic context from Ensembl GRCh38, and partitions
+variants into 3 non-IID hospital sites using Dirichlet allocation (α=0.5)
+over cancer-gene subtypes (breast / lung / colorectal panels).
 """
 
 from __future__ import annotations
 
 import json
-import random
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import numpy as np
 import pandas as pd
 
-DATA_DIR    = Path(__file__).parent / "data"
-CONTEXT_LEN = 41   # ±20 bp + the variant itself
-SEED        = 42
+from genomic_context import GenomicContextFetcher
 
-# Non-IID partitioning: site i owns chromosomes that tend to carry
-# different cancer mutation profiles (BRCA mutations heavy on chr17, etc.)
-SITE_CHROMS: Dict[str, set] = {
-    "site_1": {"1", "2", "3", "4", "5", "6", "7", "8"},       # early chromosomes
-    "site_2": {"9", "10", "11", "12", "13", "14", "15", "16"},
-    "site_3": {"17", "18", "19", "20", "21", "22", "X", "Y"},
+DATA_DIR    = Path(__file__).parent / "data"
+CONTEXT_LEN = 41   # ±20 bp around the variant
+SEED        = 42
+DIRICHLET_ALPHA = 0.5
+
+# Cancer-gene panels mirroring TCGA BRCA / LUAD / COAD mutation profiles
+CANCER_GENE_PANELS: Dict[str, Set[str]] = {
+    "breast": {
+        "BRCA1", "BRCA2", "ERBB2", "TP53", "PIK3CA", "GATA3", "CDH1",
+        "MAP3K1", "PTEN", "AKT1", "ESR1", "FOXA1", "RB1", "MYC",
+    },
+    "lung": {
+        "EGFR", "KRAS", "ALK", "MET", "STK11", "KEAP1", "NF1", "BRAF",
+        "ROS1", "RET", "ERBB2", "TP53", "RB1", "MYC", "CDKN2A",
+    },
+    "colorectal": {
+        "APC", "KRAS", "TP53", "BRAF", "PIK3CA", "SMAD4", "MLH1", "MSH2",
+        "MSH6", "PMS2", "NRAS", "FBXW7", "SOX9", "TCF7L2", "CTNNB1",
+    },
 }
+
+SITE_NAMES = ["site_1", "site_2", "site_3"]
 
 PATHOGENIC_TERMS = {"Pathogenic", "Likely pathogenic"}
 BENIGN_TERMS     = {"Benign", "Likely benign"}
 
 
-def _make_context(name: str, chrom: str, length: int = CONTEXT_LEN) -> str:
-    """
-    Synthesise a deterministic pseudo-genomic context sequence.
-    In a real pipeline, extract ±20 bp flanking context from the reference genome
-    using pysam or BioPython's Seq.fetch(); this simulation keeps the demo
-    self-contained without requiring a genome FASTA file.
-    """
-    seed_val = hash(f"{chrom}_{name}") % (2**32)
-    rng      = random.Random(seed_val)
-    return "".join(rng.choice("ACGT") for _ in range(length))
-
-
-def load_clinvar(path: Path, max_per_class: int = 10_000) -> pd.DataFrame:
+def load_clinvar(path: Path, max_per_class: int = 5_000) -> pd.DataFrame:
     print(f"Loading ClinVar from {path.name} …")
     usecols = [
         "Name", "Chromosome", "ClinicalSignificance",
-        "GeneSymbol", "Type", "Start",
+        "GeneSymbol", "Type", "Start", "Stop",
     ]
     df = pd.read_csv(
         path, sep="\t",
@@ -62,53 +59,118 @@ def load_clinvar(path: Path, max_per_class: int = 10_000) -> pd.DataFrame:
     )
 
     df["Chromosome"] = df["Chromosome"].astype(str).str.replace("chr", "", regex=False)
+    df["Start"]      = pd.to_numeric(df["Start"], errors="coerce")
+    df["Stop"]       = pd.to_numeric(df["Stop"], errors="coerce")
 
     def _label(sig: str) -> int:
-        if any(p in sig for p in PATHOGENIC_TERMS):  return 1
-        if any(b in sig for b in BENIGN_TERMS):       return 0
+        if any(p in sig for p in PATHOGENIC_TERMS):
+            return 1
+        if any(b in sig for b in BENIGN_TERMS):
+            return 0
         return -1
 
     df["label"] = df["ClinicalSignificance"].fillna("").apply(_label)
     df = df[df["label"] >= 0]
-
-    # Keep only SNVs for simplicity (clean context sequences)
     df = df[df["Type"].astype(str).str.contains("single nucleotide", case=False, na=False)]
+    df = df.dropna(subset=["Start", "Chromosome"])
+    df["Start"] = df["Start"].astype(int)
+    df["Stop"]  = df["Stop"].fillna(df["Start"]).astype(int)
 
-    # Balance classes
     pos = df[df["label"] == 1].head(max_per_class)
     neg = df[df["label"] == 0].head(max_per_class)
     df  = pd.concat([pos, neg], ignore_index=True)
-
-    df["context"] = df.apply(
-        lambda r: _make_context(str(r["Name"]), str(r["Chromosome"])), axis=1
-    )
-    df = df.sample(frac=1, random_state=SEED).reset_index(drop=True)
-
-    print(f"  Total variants: {len(df)}  (pathogenic={len(pos)}, benign={len(neg)})")
+    print(f"  Candidate variants: {len(df)}  (pathogenic={len(pos)}, benign={len(neg)})")
     return df
 
 
-def assign_sites(df: pd.DataFrame) -> pd.DataFrame:
-    def _site(chrom: str) -> str:
-        for site, chrs in SITE_CHROMS.items():
-            if chrom in chrs:
-                return site
-        return "site_1"
-    df["site"] = df["Chromosome"].apply(_site)
+def _cancer_subtype(gene: str) -> str:
+    g = str(gene).upper()
+    for subtype, panel in CANCER_GENE_PANELS.items():
+        if g in panel:
+            return subtype
+    return "other"
+
+
+def attach_genomic_context(df: pd.DataFrame) -> pd.DataFrame:
+    """Fetch real reference sequences from Ensembl; drop variants we cannot resolve."""
+    fetcher = GenomicContextFetcher(context_len=CONTEXT_LEN, flank=20)
+    contexts: List[str] = []
+    kept_idx: List[int] = []
+    failed = 0
+
+    for i, row in df.iterrows():
+        ctx = fetcher.get_context(
+            str(row["Chromosome"]),
+            int(row["Start"]),
+            int(row["Stop"]),
+        )
+        if ctx:
+            contexts.append(ctx)
+            kept_idx.append(i)
+        else:
+            failed += 1
+        if (len(contexts) + failed) % 200 == 0:
+            print(f"  Context fetch progress: {len(contexts)} ok, {failed} failed …")
+
+    fetcher.save_cache()
+    out = df.loc[kept_idx].copy()
+    out["context"] = contexts
+    print(f"  Resolved {len(out)} variants with real Ensembl context ({failed} failed).")
+    if len(out) < 100:
+        raise RuntimeError(
+            "Too few variants with real genomic context. "
+            "Check network access to rest.ensembl.org and ClinVar Start positions."
+        )
+    return out.reset_index(drop=True)
+
+
+def dirichlet_partition(df: pd.DataFrame, alpha: float = DIRICHLET_ALPHA) -> pd.DataFrame:
+    """
+    Non-IID partition: for each cancer subtype pool, split variants across
+    3 sites using Dirichlet(α, α, α) proportions (FedAlert-style heterogeneity).
+    """
+    rng  = np.random.default_rng(SEED)
+    df   = df.copy()
+    df["cancer_subtype"] = df["GeneSymbol"].apply(_cancer_subtype)
+    df["site"] = ""
+
+    for subtype in list(CANCER_GENE_PANELS.keys()) + ["other"]:
+        pool = df.index[df["cancer_subtype"] == subtype].tolist()
+        n    = len(pool)
+        if n == 0:
+            continue
+        rng.shuffle(pool)
+        props = rng.dirichlet([alpha] * 3)
+        counts = rng.multinomial(n, props)
+        pos = 0
+        for site_name, count in zip(SITE_NAMES, counts):
+            for idx in pool[pos: pos + count]:
+                df.at[idx, "site"] = site_name
+            pos += count
+
+    unassigned = df["site"] == ""
+    if unassigned.any():
+        fallback = [SITE_NAMES[i % 3] for i in range(unassigned.sum())]
+        df.loc[unassigned, "site"] = fallback
+
+    for site in SITE_NAMES:
+        n = (df["site"] == site).sum()
+        print(f"  {site}: {n} variants")
     return df
 
 
 def save_partitions(df: pd.DataFrame) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    records = df[["context", "label", "site", "GeneSymbol", "Chromosome"]].to_dict("records")
+    records = df[[
+        "context", "label", "site", "GeneSymbol", "Chromosome",
+        "cancer_subtype", "Start",
+    ]].to_dict("records")
 
-    # Save combined file (for centralized baseline)
     with (DATA_DIR / "variants.json").open("w") as fh:
         json.dump(records, fh)
     print(f"  Saved {len(records)} total variants → {DATA_DIR / 'variants.json'}")
 
-    # Save per-site partitions
-    for site in SITE_CHROMS:
+    for site in SITE_NAMES:
         subset = [r for r in records if r["site"] == site]
         with (DATA_DIR / f"{site}.json").open("w") as fh:
             json.dump(subset, fh)
@@ -122,13 +184,13 @@ def main() -> None:
     if not path.exists():
         raise FileNotFoundError(
             "ClinVar data not found.\n"
-            "Run: python scripts/download_data.py\n"
-            "Or on Kaggle: set up the ClinVar FTP download in a cell."
+            "Run: python scripts/download_data.py"
         )
     df = load_clinvar(path)
-    df = assign_sites(df)
+    df = attach_genomic_context(df)
+    df = dirichlet_partition(df)
     save_partitions(df)
-    print(f"\nData preparation complete. Run: python run_federation.py")
+    print("\nData preparation complete. Run: python run_federation.py")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@
 
 Ports the **FedAlert precision-weighted consensus aggregation framework** to
 multi-site cancer genomic somatic variant classification on ClinVar data.
-Simulates 3 hospital sites (non-IID by chromosome) with federated learning.
+Simulates 3 hospital sites with Dirichlet (α=0.5) non-IID partitioning over
+breast/lung/colorectal cancer gene panels, using real Ensembl GRCh38 flanking sequences.
 
 ---
 
